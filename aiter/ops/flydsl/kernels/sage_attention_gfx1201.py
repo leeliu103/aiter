@@ -638,6 +638,7 @@ def build_sage_attention_v2_core(
         path_tag += f"J{KEY_TAIL_PEEL_SEQ_LEN}"
     if EXPERIMENTAL_GRID_BLOCKS:
         path_tag += f"C{EXPERIMENTAL_GRID_BLOCKS}"
+    path_tag += "HM"
     allocator = SmemAllocator(
         None,
         arch=gpu_arch,
@@ -776,10 +777,10 @@ def build_sage_attention_v2_core(
         klane = lane // 16
 
         q_tiles = (valid_seq + BLOCK_M - 1) // BLOCK_M
-        head_idx = block_id % num_heads
-        batch_q_tile = block_id // num_heads
-        q_tile_idx = batch_q_tile % q_tiles
-        batch_idx = batch_q_tile // q_tiles
+        # Consecutive block IDs cover query tiles of one head for K/V reuse.
+        head_idx = (block_id // q_tiles) % num_heads
+        q_tile_idx = block_id % q_tiles
+        batch_idx = block_id // (q_tiles * num_heads)
         q_start = q_tile_idx * BLOCK_M
         q_rows = [
             q_start + wave_id * ROWS_PER_WAVE + row_group * WMMA_ROWS + lane16
