@@ -14,12 +14,14 @@ An iteration computes INT8 QK, updates online softmax, then accumulates FP8 PV.
 The helpers preserve the reference's rounding order and register ownership.
 
 Only valid query rows are written. All input padding must be initialized.
+Addressing requires fewer than 2**31 Q/K elements.
 The implementation needs Triton with Gluon RDNA4 WMMA support.
 """
 
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.experimental.gluon.language.amd import AMDWMMALayout
+from triton.experimental.gluon.language.amd.cdna3 import buffer_load
 from triton.experimental.gluon.language.amd.rdna4 import wmma
 
 BLOCK_M = 128
@@ -185,18 +187,23 @@ def _load_k_tile(
 ):
     rows = start + gl.arange(0, 32, layout=gl.SliceLayout(1, _K_LOAD_LAYOUT))
     cols = gl.arange(0, 128, layout=gl.SliceLayout(0, _K_LOAD_LAYOUT))
-    offsets = (
-        (batch_head // NUM_HEADS * PADDED_LEN + rows[:, None]) * NUM_HEADS
-        + batch_head % NUM_HEADS
-    ) * 128 + cols[None, :]
-    return gl.load(K + offsets)
+    # A scalar head base lets buffer loads use 32-bit per-lane offsets.
+    base = (
+        K
+        + (batch_head // NUM_HEADS * PADDED_LEN * NUM_HEADS + batch_head % NUM_HEADS)
+        * 128
+    )
+    offsets = rows[:, None] * (NUM_HEADS * 128) + cols[None, :]
+    return buffer_load(base, offsets)
 
 
 @gluon.jit
 def _load_v_tile(V, start, batch_head, PADDED_LEN: gl.constexpr):
     rows = start + gl.arange(0, 32, layout=gl.SliceLayout(1, _V_LOAD_LAYOUT))
     cols = gl.arange(0, 128, layout=gl.SliceLayout(0, _V_LOAD_LAYOUT))
-    return gl.load(V + (batch_head * 128 + cols[None, :]) * PADDED_LEN + rows[:, None])
+    base = V + batch_head * 128 * PADDED_LEN
+    offsets = cols[None, :] * PADDED_LEN + rows[:, None]
+    return buffer_load(base, offsets)
 
 
 @gluon.jit
@@ -229,7 +236,7 @@ def _attention_tile(
     # fence does not wait for the next tile's loads.
     gl.barrier()
     if PREFETCH:
-        next_start = gl.where(start + 32 < PADDED_LEN, start + 32, 0)
+        next_start = start + 32
         next_k = _load_k_tile(K, next_start, batch_head, PADDED_LEN, NUM_HEADS)
         next_v = _load_v_tile(V, next_start, batch_head, PADDED_LEN)
     else:
@@ -372,8 +379,9 @@ def _sage_attention_int8_fp8(
     loaded_k = _load_k_tile(K, 0, batch_head, PADDED_LEN, NUM_HEADS)
     loaded_v = _load_v_tile(V, 0, batch_head, PADDED_LEN)
 
-    # Full tiles avoid masks in the hot loop; only the final partial tile masks K.
-    for start in range(0, SEQ_LEN // 32 * 32, 32):
+    # Every loop iteration has a successor; the last tile needs no prefetch.
+    last_start: gl.constexpr = (SEQ_LEN - 1) // 32 * 32
+    for start in range(0, last_start, 32):
         acc, row_max, denominator, loaded_k, loaded_v = _attention_tile(
             q_fragment,
             K,
@@ -393,26 +401,25 @@ def _sage_attention_int8_fp8(
             MASK_TAIL=False,
             PREFETCH=True,
         )
-    if SEQ_LEN % 32:
-        acc, row_max, denominator, loaded_k, loaded_v = _attention_tile(
-            q_fragment,
-            K,
-            V,
-            KScale,
-            q_scale,
-            loaded_k,
-            loaded_v,
-            acc,
-            row_max,
-            denominator,
-            SEQ_LEN // 32 * 32,
-            batch_head,
-            SEQ_LEN,
-            PADDED_LEN,
-            NUM_HEADS,
-            MASK_TAIL=True,
-            PREFETCH=False,
-        )
+    acc, row_max, denominator, loaded_k, loaded_v = _attention_tile(
+        q_fragment,
+        K,
+        V,
+        KScale,
+        q_scale,
+        loaded_k,
+        loaded_v,
+        acc,
+        row_max,
+        denominator,
+        last_start,
+        batch_head,
+        SEQ_LEN,
+        PADDED_LEN,
+        NUM_HEADS,
+        MASK_TAIL=SEQ_LEN % 32 != 0,
+        PREFETCH=False,
+    )
 
     _store_output(
         acc,
