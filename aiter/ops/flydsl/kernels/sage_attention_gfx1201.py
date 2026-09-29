@@ -1134,7 +1134,9 @@ def build_sage_attention_v2_core(
                                 [LDS_V_BASE + d_row * V_STRIDE + token_offset],
                             )
 
-                gpu.barrier()
+                gpu.barrier(
+                    address_spaces=ir.ArrayAttr.get([gpu.smem_space()])
+                )
 
             # Keep next-tile VMEM values live while this tile computes, then
             # commit them to LDS at the next iteration.
@@ -1501,7 +1503,9 @@ def build_sage_attention_v2_core(
             if const_expr(
                 not DB_KV_PIPELINE and not EXPERIMENTAL_BARRIER_OVERLAP
             ):
-                gpu.barrier()
+                gpu.barrier(
+                    address_spaces=ir.ArrayAttr.get([gpu.smem_space()])
+                )
             next_args = []
             for row_group in range_constexpr(ROW_GROUPS_PER_WAVE):
                 m_new, l_new, o_accs = row_next_states[row_group]
