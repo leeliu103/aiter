@@ -244,6 +244,7 @@ def _attention_tile(
         next_v = loaded_v
 
     k_fragment = k_shared.permute((1, 0)).load(gl.DotOperandLayout(1, _WMMA_LAYOUT, 8))
+    v_fragment = v_shared.load(gl.DotOperandLayout(1, _WMMA_LAYOUT, 8))
     scores = wmma(
         q_fragment, k_fragment, gl.full([128, 32], 0, gl.int32, _WMMA_LAYOUT)
     ).to(gl.float32)
@@ -269,7 +270,6 @@ def _attention_tile(
     denominator = gl.fma(row_rescale[:, None], denominator, peer_sum) + local_sum
     fp8_probabilities = _probabilities_to_fp8(probabilities)
     acc = gl.map_elementwise(_rescale_accumulator64, acc, alpha[:, None], pack=64)[0]
-    v_fragment = v_shared.load(gl.DotOperandLayout(1, _WMMA_LAYOUT, 8))
     p_fragment = gl.convert_layout(
         fp8_probabilities, gl.DotOperandLayout(0, _WMMA_LAYOUT, 8)
     )
