@@ -121,13 +121,17 @@ def _expand_row_pairs(row_values):
     )
 
 
+# fmt: off
 @gluon.jit
-def _rescale_groups(a0, a1, a2, a3, a4, a5, a6, a7, scale):
-    """Gate eight values from the same row with one scale comparison."""
+def _rescale_eight(a0, a1, a2, a3, a4, a5, a6, a7,
+                   s0, s1, s2, s3, s4, s5, s6, s7):
+    """Rescale eight accumulator values for map_elementwise(pack=8)."""
+    # pack=8 also supplies eight scale copies; each lane owns just one row.
     values = (a0, a1, a2, a3, a4, a5, a6, a7)
-    if scale != 1.0:
-        values = [value * scale for value in values]
+    if s0 != 1.0:
+        values = [value * s0 for value in values]
     return values
+# fmt: on
 
 
 @gluon.jit
@@ -235,29 +239,7 @@ def _attention_tile(
     fp8_weights = gl.map_elementwise(_convert_four_fp8, weights, pack=4)[0].to(
         gl.float8e4nv, bitcast=True
     )
-    # Eight 16-channel views keep the callback small without moving lanes.
-    groups = (acc,)
-    for _ in gl.static_range(3):
-        halves = ()
-        for i in gl.static_range(len(groups)):
-            halves += _split_channels(groups[i])
-        groups = halves
-    groups = gl.map_elementwise(_rescale_groups, *groups, alpha[:, None])
-    for _ in gl.static_range(3):
-        joined = ()
-        for i in gl.static_range(len(groups) // 2):
-            left = groups[2 * i]
-            right = groups[2 * i + 1]
-            joined_channels = gl.permute(gl.join(left, right), (0, 2, 1))
-            joined += (
-                gl.convert_layout(
-                    gl.reshape(joined_channels, [128, left.shape[1] * 2]),
-                    _WMMA_LAYOUT,
-                    assert_trivial=True,
-                ),
-            )
-        groups = joined
-    acc = groups[0]
+    acc = gl.map_elementwise(_rescale_eight, acc, alpha[:, None], pack=8)[0]
     p_fragment = gl.convert_layout(fp8_weights, gl.DotOperandLayout(0, _WMMA_LAYOUT, 8))
     acc = wmma(p_fragment, v_fragment, acc)
     # Hold both allocations through the barrier: every wave must finish its
