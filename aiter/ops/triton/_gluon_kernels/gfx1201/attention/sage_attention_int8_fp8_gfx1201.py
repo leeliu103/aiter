@@ -88,13 +88,6 @@ def _convert_four_fp8(x0, x1, x2, x3):
 
 
 @gluon.jit
-def _weights_to_fp8(x):
-    return gl.map_elementwise(_convert_four_fp8, x, pack=4)[0].to(
-        gl.float8e4nv, bitcast=True
-    )
-
-
-@gluon.jit
 def _split_channels(x):
     """Split the channel axis in half without moving values between lanes."""
     halves = gl.permute(gl.reshape(x, [128, 2, x.shape[1] // 2]), (0, 2, 1))
@@ -117,26 +110,6 @@ def _sum16(x0, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15)
 
 
 @gluon.jit
-def _lane_weight_sums(weights):
-    # Each row spans two lanes, owning keys 0..7,16..23 and 8..15,24..31.
-    local_sum = gl.map_elementwise(_sum16, weights, pack=16)[0]
-    # Collapse register copies to one scalar per lane. These maxima only
-    # select identical copies; they perform no additional probability sum.
-    local_sum = gl.max(gl.max(gl.reshape(local_sum, [128, 2, 2, 8]), 3), 1)
-    local_sum = gl.convert_layout(local_sum, _ROW_PAIR_LAYOUT, assert_trivial=True)
-    # Exchange corresponding lanes in the wave's two 16-lane halves.
-    peer_sum = gl.inline_asm_elementwise(
-        "v_permlanex16_b32 $0, $1, $2, 0xfedcba98 op_sel:[1,0]",
-        constraints="=v,v,s",
-        args=[local_sum, 0x76543210],
-        dtype=gl.float32,
-        is_pure=True,
-        pack=1,
-    )
-    return local_sum, peer_sum
-
-
-@gluon.jit
 def _expand_row_pairs(row_values):
     """Broadcast each row's two lane values to their owning WMMA columns."""
     # Restore column ownership: lane 0..15 owns 0..7 and 16..23;
@@ -150,45 +123,13 @@ def _expand_row_pairs(row_values):
     )
 
 
-# map_elementwise(pack=64) requires this fixed scalar callback signature:
-# 64 accumulator values, then 64 broadcast copies of the row's scale factor.
-# Only scale0 is needed. One per-lane branch skips all 64 multiplies when it
-# equals 1; mapping one accumulator at a time emits slower code on this build.
-# fmt: off
 @gluon.jit
-def _rescale_accumulator64(
-    a0, a1, a2, a3, a4, a5, a6, a7,
-    a8, a9, a10, a11, a12, a13, a14, a15,
-    a16, a17, a18, a19, a20, a21, a22, a23,
-    a24, a25, a26, a27, a28, a29, a30, a31,
-    a32, a33, a34, a35, a36, a37, a38, a39,
-    a40, a41, a42, a43, a44, a45, a46, a47,
-    a48, a49, a50, a51, a52, a53, a54, a55,
-    a56, a57, a58, a59, a60, a61, a62, a63,
-    scale0, scale1, scale2, scale3, scale4, scale5, scale6, scale7,
-    scale8, scale9, scale10, scale11, scale12, scale13, scale14, scale15,
-    scale16, scale17, scale18, scale19, scale20, scale21, scale22, scale23,
-    scale24, scale25, scale26, scale27, scale28, scale29, scale30, scale31,
-    scale32, scale33, scale34, scale35, scale36, scale37, scale38, scale39,
-    scale40, scale41, scale42, scale43, scale44, scale45, scale46, scale47,
-    scale48, scale49, scale50, scale51, scale52, scale53, scale54, scale55,
-    scale56, scale57, scale58, scale59, scale60, scale61, scale62, scale63,
-):
-    values = (
-        a0, a1, a2, a3, a4, a5, a6, a7,
-        a8, a9, a10, a11, a12, a13, a14, a15,
-        a16, a17, a18, a19, a20, a21, a22, a23,
-        a24, a25, a26, a27, a28, a29, a30, a31,
-        a32, a33, a34, a35, a36, a37, a38, a39,
-        a40, a41, a42, a43, a44, a45, a46, a47,
-        a48, a49, a50, a51, a52, a53, a54, a55,
-        a56, a57, a58, a59, a60, a61, a62, a63,
-    )
-    if scale0 != 1.0:
-        # Gluon unrolls this tuple comprehension at compile time.
-        values = [value * scale0 for value in values]
+def _rescale_groups(a0, a1, a2, a3, a4, a5, a6, a7, scale):
+    """Gate eight values from the same row with one scale comparison."""
+    values = (a0, a1, a2, a3, a4, a5, a6, a7)
+    if scale != 1.0:
+        values = [value * scale for value in values]
     return values
-# fmt: on
 
 
 @gluon.jit
@@ -271,7 +212,21 @@ def _attention_tile(
     new_shifted_max = gl.maximum(shifted_max, tile_shifted_max)
     alpha = gl.exp2(shifted_max - new_shifted_max)
     weights = gl.exp2(gl.fma(scores, scale[:, None], -new_shifted_max[:, None]))
-    local_sum, peer_sum = _lane_weight_sums(weights)
+    # Each row spans two lanes, owning keys 0..7,16..23 and 8..15,24..31.
+    local_sum = gl.map_elementwise(_sum16, weights, pack=16)[0]
+    # Collapse register copies to one scalar per lane. These maxima only
+    # select identical copies; they perform no additional probability sum.
+    local_sum = gl.max(gl.max(gl.reshape(local_sum, [128, 2, 2, 8]), 3), 1)
+    local_sum = gl.convert_layout(local_sum, _ROW_PAIR_LAYOUT, assert_trivial=True)
+    # Exchange corresponding lanes in the wave's two 16-lane halves.
+    peer_sum = gl.inline_asm_elementwise(
+        "v_permlanex16_b32 $0, $1, $2, 0xfedcba98 op_sel:[1,0]",
+        constraints="=v,v,s",
+        args=[local_sum, 0x76543210],
+        dtype=gl.float32,
+        is_pure=True,
+        pack=1,
+    )
     # The two lanes add local/peer sums in opposite orders. Keep both denominators
     # and this FMA/add sequence to preserve their distinct FP32 rounding.
     row_rescale = gl.convert_layout(
@@ -279,8 +234,32 @@ def _attention_tile(
     )
     denominator = gl.fma(row_rescale[:, None], denominator, peer_sum) + local_sum
     # The denominator uses FP32 weights; only the PV operand is rounded to FP8.
-    fp8_weights = _weights_to_fp8(weights)
-    acc = gl.map_elementwise(_rescale_accumulator64, acc, alpha[:, None], pack=64)[0]
+    fp8_weights = gl.map_elementwise(_convert_four_fp8, weights, pack=4)[0].to(
+        gl.float8e4nv, bitcast=True
+    )
+    # Eight 16-channel views keep the callback small without moving lanes.
+    groups = (acc,)
+    for _ in gl.static_range(3):
+        halves = ()
+        for i in gl.static_range(len(groups)):
+            halves += _split_channels(groups[i])
+        groups = halves
+    groups = gl.map_elementwise(_rescale_groups, *groups, alpha[:, None])
+    for _ in gl.static_range(3):
+        joined = ()
+        for i in gl.static_range(len(groups) // 2):
+            left = groups[2 * i]
+            right = groups[2 * i + 1]
+            joined_channels = gl.permute(gl.join(left, right), (0, 2, 1))
+            joined += (
+                gl.convert_layout(
+                    gl.reshape(joined_channels, [128, left.shape[1] * 2]),
+                    _WMMA_LAYOUT,
+                    assert_trivial=True,
+                ),
+            )
+        groups = joined
+    acc = groups[0]
     p_fragment = gl.convert_layout(fp8_weights, gl.DotOperandLayout(0, _WMMA_LAYOUT, 8))
     acc = wmma(p_fragment, v_fragment, acc)
     # Hold both allocations through the barrier: every wave must finish its
@@ -289,55 +268,6 @@ def _attention_tile(
     k_shared._keep_alive()
     v_shared._keep_alive()
     return acc, new_shifted_max, denominator, next_k, next_v
-
-
-@gluon.jit
-def _store_output(
-    acc,
-    shifted_max,
-    denominator,
-    VScale,
-    Out,
-    LSE,
-    rows,
-    batch_head,
-    SEQ_LEN: gl.constexpr,
-    PADDED_LEN: gl.constexpr,
-    NUM_HEADS: gl.constexpr,
-    RETURN_LSE: gl.constexpr,
-):
-    """Normalize four channel groups, then optionally store natural-log LSE."""
-    # Match the reference's native reciprocal rather than a division sequence.
-    inv_denominator = gl.inline_asm_elementwise(
-        "v_rcp_f32 $0, $1;",
-        constraints="=v,v",
-        args=[denominator],
-        dtype=gl.float32,
-        is_pure=True,
-        pack=1,
-    )
-    inv_denominator = _expand_row_pairs(inv_denominator)
-    left, right = _split_channels(acc)
-    o0, o1 = _split_channels(left)
-    o2, o3 = _split_channels(right)
-    for part in gl.static_range(4):
-        partial = (o0, o1, o2, o3)[part]
-        channels = part * 32 + gl.arange(0, 32, layout=gl.SliceLayout(0, _WMMA_LAYOUT))
-        v_scale = gl.load(VScale + batch_head * 128 + channels)
-        # Preserve the two rounding steps: normalize first, then apply VScale.
-        out = (partial * inv_denominator) * v_scale[None, :]
-        offsets = (
-            (batch_head // NUM_HEADS * PADDED_LEN + rows[:, None]) * NUM_HEADS
-            + batch_head % NUM_HEADS
-        ) * 128 + channels[None, :]
-        gl.store(Out + offsets, out, rows[:, None] < SEQ_LEN)
-    if RETURN_LSE:
-        # The reference takes LSE from the first lane's denominator.
-        denominator = _expand_row_pairs(denominator)
-        col = gl.arange(0, 32, layout=gl.SliceLayout(0, _WMMA_LAYOUT))
-        lse_denominator = gl.sum(gl.where(col[None, :] == 0, denominator, 0.0), 1)
-        lse = (shifted_max + gl.log2(lse_denominator)) * 0.6931471805599453
-        gl.store(LSE + batch_head * PADDED_LEN + rows, lse, rows < SEQ_LEN)
 
 
 @gluon.jit
@@ -435,17 +365,34 @@ def _sage_attention_int8_fp8(
         PREFETCH=False,
     )
 
-    _store_output(
-        acc,
-        shifted_max,
-        denominator,
-        VScale,
-        Out,
-        LSE,
-        rows,
-        batch_head,
-        SEQ_LEN,
-        PADDED_LEN,
-        NUM_HEADS,
-        RETURN_LSE,
+    # Match the reference's native reciprocal rather than a division sequence.
+    inv_denominator = gl.inline_asm_elementwise(
+        "v_rcp_f32 $0, $1;",
+        constraints="=v,v",
+        args=[denominator],
+        dtype=gl.float32,
+        is_pure=True,
+        pack=1,
     )
+    inv_denominator = _expand_row_pairs(inv_denominator)
+    left, right = _split_channels(acc)
+    o0, o1 = _split_channels(left)
+    o2, o3 = _split_channels(right)
+    for part in gl.static_range(4):
+        partial = (o0, o1, o2, o3)[part]
+        channels = part * 32 + gl.arange(0, 32, layout=gl.SliceLayout(0, _WMMA_LAYOUT))
+        v_scale = gl.load(VScale + batch_head * 128 + channels)
+        # Preserve the two rounding steps: normalize first, then apply VScale.
+        out = (partial * inv_denominator) * v_scale[None, :]
+        offsets = (
+            (batch_head // NUM_HEADS * PADDED_LEN + rows[:, None]) * NUM_HEADS
+            + batch_head % NUM_HEADS
+        ) * 128 + channels[None, :]
+        gl.store(Out + offsets, out, rows[:, None] < SEQ_LEN)
+    if RETURN_LSE:
+        # The reference takes LSE from the first lane's denominator.
+        denominator = _expand_row_pairs(denominator)
+        col = gl.arange(0, 32, layout=gl.SliceLayout(0, _WMMA_LAYOUT))
+        lse_denominator = gl.sum(gl.where(col[None, :] == 0, denominator, 0.0), 1)
+        lse = (shifted_max + gl.log2(lse_denominator)) * 0.6931471805599453
+        gl.store(LSE + batch_head * PADDED_LEN + rows, lse, rows < SEQ_LEN)
