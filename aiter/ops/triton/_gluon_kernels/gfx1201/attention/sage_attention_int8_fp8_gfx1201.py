@@ -115,9 +115,7 @@ def _expand_row_pairs(row_values):
     # Restore column ownership: lane 0..15 owns 0..7 and 16..23;
     # lane 16..31 owns 8..15 and 24..31.
     expanded = gl.reshape(row_values, [128, 1, 2, 1])
-    expanded, _ = gl.broadcast(
-        expanded, gl.full([128, 2, 2, 8], 0.0, gl.float32, expanded.type.layout)
-    )
+    expanded = expanded.broadcast_to((128, 2, 2, 8))
     return gl.convert_layout(
         gl.reshape(expanded, [128, 32]), _WMMA_LAYOUT, assert_trivial=True
     )
@@ -285,7 +283,7 @@ def _sage_attention_int8_fp8(
     NUM_HEADS: gl.constexpr,
     RETURN_LSE: gl.constexpr = False,
 ):
-    gl.static_assert(SEQ_LEN > 0 and PADDED_LEN >= SEQ_LEN and PADDED_LEN % 32 == 0)
+    gl.static_assert(SEQ_LEN > 0)
     gl.static_assert(PADDED_LEN == ((SEQ_LEN + 31) // 32) * 32)
     gl.static_assert(Q.dtype.element_ty == gl.int8 and K.dtype.element_ty == gl.int8)
     gl.static_assert(V.dtype.element_ty == gl.float8e4nv)
@@ -324,7 +322,7 @@ def _sage_attention_int8_fp8(
     loaded_v = _load_v_tile(V, 0, batch_head, PADDED_LEN)
 
     # Every loop iteration has a successor; the last tile needs no prefetch.
-    last_key_start: gl.constexpr = (SEQ_LEN - 1) // 32 * 32
+    last_key_start: gl.constexpr = PADDED_LEN - 32
     for key_start in range(0, last_key_start, 32):
         acc, shifted_max, denominator, loaded_k, loaded_v = _attention_tile(
             q_fragment,
@@ -345,7 +343,7 @@ def _sage_attention_int8_fp8(
             MASK_TAIL=False,
             PREFETCH=True,
         )
-    acc, shifted_max, denominator, loaded_k, loaded_v = _attention_tile(
+    acc, shifted_max, denominator, _, _ = _attention_tile(
         q_fragment,
         K,
         V,
@@ -378,9 +376,10 @@ def _sage_attention_int8_fp8(
     left, right = _split_channels(acc)
     o0, o1 = _split_channels(left)
     o2, o3 = _split_channels(right)
+    cols = gl.arange(0, 32, layout=gl.SliceLayout(0, _WMMA_LAYOUT))
     for part in gl.static_range(4):
         partial = (o0, o1, o2, o3)[part]
-        channels = part * 32 + gl.arange(0, 32, layout=gl.SliceLayout(0, _WMMA_LAYOUT))
+        channels = part * 32 + cols
         v_scale = gl.load(VScale + batch_head * 128 + channels)
         # Preserve the two rounding steps: normalize first, then apply VScale.
         out = (partial * inv_denominator) * v_scale[None, :]
@@ -392,7 +391,6 @@ def _sage_attention_int8_fp8(
     if RETURN_LSE:
         # The reference takes LSE from the first lane's denominator.
         denominator = _expand_row_pairs(denominator)
-        col = gl.arange(0, 32, layout=gl.SliceLayout(0, _WMMA_LAYOUT))
-        lse_denominator = gl.sum(gl.where(col[None, :] == 0, denominator, 0.0), 1)
+        lse_denominator = gl.sum(gl.where(cols[None, :] == 0, denominator, 0.0), 1)
         lse = (shifted_max + gl.log2(lse_denominator)) * 0.6931471805599453
         gl.store(LSE + batch_head * PADDED_LEN + rows, lse, rows < SEQ_LEN)
