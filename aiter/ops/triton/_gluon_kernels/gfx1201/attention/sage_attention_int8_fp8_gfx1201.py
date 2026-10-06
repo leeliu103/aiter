@@ -32,6 +32,10 @@ from triton.experimental.gluon.language.amd.cdna3 import buffer_load
 from triton.experimental.gluon.language.amd.rdna4 import wmma
 
 BLOCK_M = 128
+# Fixed geometry for this gfx1201 specialization.
+_BLOCK_M = gl.constexpr(BLOCK_M)
+_BLOCK_N = gl.constexpr(32)
+_HEAD_DIM = gl.constexpr(128)
 LAUNCH_OPTIONS = {"num_warps": 8, "num_stages": 1, "waves_per_eu": 0}
 
 # Explicit constexpr wrappers include layouts in Triton's compilation key.
@@ -90,7 +94,7 @@ def _convert_four_fp8(x0, x1, x2, x3):
 @gluon.jit
 def _split_channels(x):
     """Split the channel axis in half without moving values between lanes."""
-    halves = gl.permute(gl.reshape(x, [128, 2, x.shape[1] // 2]), (0, 2, 1))
+    halves = gl.permute(gl.reshape(x, [_BLOCK_M, 2, x.shape[1] // 2]), (0, 2, 1))
     left, right = gl.split(halves)
     return (
         gl.convert_layout(left, _WMMA_LAYOUT, assert_trivial=True),
@@ -114,10 +118,10 @@ def _expand_row_pairs(row_values):
     """Broadcast each row's two lane values to their owning WMMA columns."""
     # Restore column ownership: lane 0..15 owns 0..7 and 16..23;
     # lane 16..31 owns 8..15 and 24..31.
-    expanded = gl.reshape(row_values, [128, 1, 2, 1])
-    expanded = expanded.broadcast_to((128, 2, 2, 8))
+    expanded = gl.reshape(row_values, [_BLOCK_M, 1, 2, 1])
+    expanded = expanded.broadcast_to((_BLOCK_M, 2, 2, 8))
     return gl.convert_layout(
-        gl.reshape(expanded, [128, 32]), _WMMA_LAYOUT, assert_trivial=True
+        gl.reshape(expanded, [_BLOCK_M, 32]), _WMMA_LAYOUT, assert_trivial=True
     )
 
 
@@ -157,23 +161,23 @@ def _rescale_accumulator64(
 def _load_k_tile(
     K, key_start, batch_head, PADDED_LEN: gl.constexpr, NUM_HEADS: gl.constexpr
 ):
-    rows = key_start + gl.arange(0, 32, layout=gl.SliceLayout(1, _K_LOAD_LAYOUT))
-    cols = gl.arange(0, 128, layout=gl.SliceLayout(0, _K_LOAD_LAYOUT))
+    rows = key_start + gl.arange(0, _BLOCK_N, layout=gl.SliceLayout(1, _K_LOAD_LAYOUT))
+    cols = gl.arange(0, _HEAD_DIM, layout=gl.SliceLayout(0, _K_LOAD_LAYOUT))
     # A scalar head base lets buffer loads use 32-bit per-lane offsets.
     base = (
         K
         + (batch_head // NUM_HEADS * PADDED_LEN * NUM_HEADS + batch_head % NUM_HEADS)
-        * 128
+        * _HEAD_DIM
     )
-    offsets = rows[:, None] * (NUM_HEADS * 128) + cols[None, :]
+    offsets = rows[:, None] * (NUM_HEADS * _HEAD_DIM) + cols[None, :]
     return buffer_load(base, offsets)
 
 
 @gluon.jit
 def _load_v_tile(V, key_start, batch_head, PADDED_LEN: gl.constexpr):
-    rows = key_start + gl.arange(0, 32, layout=gl.SliceLayout(1, _V_LOAD_LAYOUT))
-    cols = gl.arange(0, 128, layout=gl.SliceLayout(0, _V_LOAD_LAYOUT))
-    base = V + batch_head * 128 * PADDED_LEN
+    rows = key_start + gl.arange(0, _BLOCK_N, layout=gl.SliceLayout(1, _V_LOAD_LAYOUT))
+    cols = gl.arange(0, _HEAD_DIM, layout=gl.SliceLayout(0, _V_LOAD_LAYOUT))
+    base = V + batch_head * _HEAD_DIM * PADDED_LEN
     offsets = cols[None, :] * PADDED_LEN + rows[:, None]
     return buffer_load(base, offsets)
 
@@ -198,34 +202,43 @@ def _attention_tile(
     MASK_TAIL: gl.constexpr,
     PREFETCH: gl.constexpr,
 ):
-    """Consume one K/V tile and return updated attention state and prefetched K/V."""
+    """Consume one K/V tile and return updated attention state and prefetched K/V.
+
+    acc is the unnormalized FP32 output numerator. shifted_max is the
+    running base-2 logit maximum minus 8.807. denominator holds the two
+    lane-specific normalization sums for each query row.
+    """
     # Store both tiles before reading K, and prefetch the next pair during QK.
-    k_shared = gl.allocate_shared_memory(gl.int8, [32, 128], _K_SHARED_LAYOUT, loaded_k)
+    k_shared = gl.allocate_shared_memory(
+        gl.int8, [_BLOCK_N, _HEAD_DIM], _K_SHARED_LAYOUT, loaded_k
+    )
     v_shared = gl.allocate_shared_memory(
-        gl.float8e4nv, [32, 128], _V_SHARED_LAYOUT, loaded_v
+        gl.float8e4nv, [_BLOCK_N, _HEAD_DIM], _V_SHARED_LAYOUT, loaded_v
     )
     # Keep prefetches after the producer barrier so its global-memory
     # fence does not wait for the next tile's loads.
     gl.barrier()
     if PREFETCH:
-        next_key_start = key_start + 32
+        next_key_start = key_start + _BLOCK_N
         next_k = _load_k_tile(K, next_key_start, batch_head, PADDED_LEN, NUM_HEADS)
         next_v = _load_v_tile(V, next_key_start, batch_head, PADDED_LEN)
     else:
         next_k = loaded_k
         next_v = loaded_v
 
+    # Compute the QK score tile.
     k_fragment = k_shared.permute((1, 0)).load(gl.DotOperandLayout(1, _WMMA_LAYOUT, 8))
     v_fragment = v_shared.load(gl.DotOperandLayout(1, _WMMA_LAYOUT, 8))
     scores = wmma(
-        q_fragment, k_fragment, gl.full([128, 32], 0, gl.int32, _WMMA_LAYOUT)
+        q_fragment, k_fragment, gl.full([_BLOCK_M, _BLOCK_N], 0, gl.int32, _WMMA_LAYOUT)
     ).to(gl.float32)
-    cols = gl.arange(0, 32, layout=gl.SliceLayout(0, _WMMA_LAYOUT))
+    cols = gl.arange(0, _BLOCK_N, layout=gl.SliceLayout(0, _WMMA_LAYOUT))
     if MASK_TAIL:
         scores = gl.where(key_start + cols[None, :] < SEQ_LEN, scores, float("-inf"))
     k_scale = gl.load(KScale + batch_head * (PADDED_LEN // 32) + key_start // 32)
     scale = q_scale * k_scale
 
+    # Update the online softmax maximum and weights.
     # Track the largest base-2 logit minus 8.807, so the largest unnormalized
     # weight is near FP8's maximum (448). Preserve the literal and FMA order:
     # replacing 8.807 with log2(448) changes the reference's rounding.
@@ -233,11 +246,13 @@ def _attention_tile(
     new_shifted_max = gl.maximum(shifted_max, tile_shifted_max)
     alpha = gl.exp2(shifted_max - new_shifted_max)
     weights = gl.exp2(gl.fma(scores, scale[:, None], -new_shifted_max[:, None]))
+
+    # Update the denominator from FP32 weights.
     # Each row spans two lanes, owning keys 0..7,16..23 and 8..15,24..31.
     local_sum = gl.map_elementwise(_sum16, weights, pack=16)[0]
     # Collapse register copies to one scalar per lane. These maxima only
     # select identical copies; they perform no additional probability sum.
-    local_sum = gl.max(gl.max(gl.reshape(local_sum, [128, 2, 2, 8]), 3), 1)
+    local_sum = gl.max(gl.max(gl.reshape(local_sum, [_BLOCK_M, 2, 2, 8]), 3), 1)
     local_sum = gl.convert_layout(local_sum, _ROW_PAIR_LAYOUT, assert_trivial=True)
     # Exchange corresponding lanes in the wave's two 16-lane halves.
     peer_sum = gl.inline_asm_elementwise(
@@ -254,6 +269,8 @@ def _attention_tile(
         alpha, gl.SliceLayout(1, _ROW_PAIR_LAYOUT), assert_trivial=True
     )
     denominator = gl.fma(row_rescale[:, None], denominator, peer_sum) + local_sum
+
+    # Rescale the output numerator and accumulate the FP8 PV product.
     # The denominator uses FP32 weights; only the PV operand is rounded to FP8.
     fp8_weights = gl.map_elementwise(_convert_four_fp8, weights, pack=4)[0].to(
         gl.float8e4nv, bitcast=True
@@ -261,6 +278,7 @@ def _attention_tile(
     acc = gl.map_elementwise(_rescale_accumulator64, acc, alpha[:, None], pack=64)[0]
     p_fragment = gl.convert_layout(fp8_weights, gl.DotOperandLayout(0, _WMMA_LAYOUT, 8))
     acc = wmma(p_fragment, v_fragment, acc)
+
     # Hold both allocations through the barrier: every wave must finish its
     # reads before the next iteration can reuse this LDS storage.
     gl.barrier()
@@ -296,35 +314,41 @@ def _sage_attention_int8_fp8(
     gl.static_assert(
         Out.dtype.element_ty == gl.bfloat16 or Out.dtype.element_ty == gl.float16
     )
-    q_tiles: gl.constexpr = (SEQ_LEN + 127) // 128
+    q_tiles: gl.constexpr = (SEQ_LEN + (_BLOCK_M - 1)) // _BLOCK_M
     block = gl.program_id(0)
     query_tile = block % q_tiles
     batch_head = block // q_tiles
     # Consecutive programs process consecutive query tiles of the same head.
-    rows = query_tile * 128 + gl.arange(0, 128, layout=gl.SliceLayout(1, _WMMA_LAYOUT))
+    rows = query_tile * _BLOCK_M + gl.arange(
+        0, _BLOCK_M, layout=gl.SliceLayout(1, _WMMA_LAYOUT)
+    )
     # Load Q directly into WMMA fragments, eight adjacent channels per lane.
     q_layout: gl.constexpr = gl.DotOperandLayout(0, _WMMA_LAYOUT, 8)
-    q_rows = query_tile * 128 + gl.arange(0, 128, layout=gl.SliceLayout(1, q_layout))
-    q_channels = gl.arange(0, 128, layout=gl.SliceLayout(0, q_layout))
+    q_rows = query_tile * _BLOCK_M + gl.arange(
+        0, _BLOCK_M, layout=gl.SliceLayout(1, q_layout)
+    )
+    q_channels = gl.arange(0, _HEAD_DIM, layout=gl.SliceLayout(0, q_layout))
     q_offsets = (
         (batch_head // NUM_HEADS * PADDED_LEN + q_rows[:, None]) * NUM_HEADS
         + batch_head % NUM_HEADS
-    ) * 128 + q_channels[None, :]
+    ) * _HEAD_DIM + q_channels[None, :]
     q_fragment = gl.load(Q + q_offsets, q_rows[:, None] < SEQ_LEN, 0)
     q_scale = gl.load(
         QScale + batch_head * (PADDED_LEN // 32) + rows // 32, rows < SEQ_LEN, 0.0
     )
+
+    # Initialize online softmax state and preload the first K/V tile.
     shifted_max = gl.full(
-        [128], float("-inf"), gl.float32, gl.SliceLayout(1, _WMMA_LAYOUT)
+        [_BLOCK_M], float("-inf"), gl.float32, gl.SliceLayout(1, _WMMA_LAYOUT)
     )
-    denominator = gl.full([128, 2], 0.0, gl.float32, _ROW_PAIR_LAYOUT)
-    acc = gl.full([128, 128], 0.0, gl.float32, _WMMA_LAYOUT)
+    denominator = gl.full([_BLOCK_M, 2], 0.0, gl.float32, _ROW_PAIR_LAYOUT)
+    acc = gl.full([_BLOCK_M, _HEAD_DIM], 0.0, gl.float32, _WMMA_LAYOUT)
     loaded_k = _load_k_tile(K, 0, batch_head, PADDED_LEN, NUM_HEADS)
     loaded_v = _load_v_tile(V, 0, batch_head, PADDED_LEN)
 
     # Every loop iteration has a successor; the last tile needs no prefetch.
-    last_key_start: gl.constexpr = PADDED_LEN - 32
-    for key_start in range(0, last_key_start, 32):
+    last_key_start: gl.constexpr = PADDED_LEN - _BLOCK_N
+    for key_start in range(0, last_key_start, _BLOCK_N):
         acc, shifted_max, denominator, loaded_k, loaded_v = _attention_tile(
             q_fragment,
             K,
@@ -360,10 +384,11 @@ def _sage_attention_int8_fp8(
         SEQ_LEN,
         PADDED_LEN,
         NUM_HEADS,
-        MASK_TAIL=SEQ_LEN % 32 != 0,
+        MASK_TAIL=SEQ_LEN % _BLOCK_N != 0,
         PREFETCH=False,
     )
 
+    # Normalize and store the output.
     # Match the reference's native reciprocal rather than a division sequence.
     inv_denominator = gl.inline_asm_elementwise(
         "v_rcp_f32 $0, $1;",
@@ -381,13 +406,13 @@ def _sage_attention_int8_fp8(
     for part in gl.static_range(4):
         partial = (o0, o1, o2, o3)[part]
         channels = part * 32 + cols
-        v_scale = gl.load(VScale + batch_head * 128 + channels)
+        v_scale = gl.load(VScale + batch_head * _HEAD_DIM + channels)
         # Preserve the two rounding steps: normalize first, then apply VScale.
         out = (partial * inv_denominator) * v_scale[None, :]
         offsets = (
             (batch_head // NUM_HEADS * PADDED_LEN + rows[:, None]) * NUM_HEADS
             + batch_head % NUM_HEADS
-        ) * 128 + channels[None, :]
+        ) * _HEAD_DIM + channels[None, :]
         gl.store(Out + offsets, out, rows[:, None] < SEQ_LEN)
     if RETURN_LSE:
         # The reference takes LSE from the first lane's denominator.
