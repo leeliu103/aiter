@@ -121,15 +121,34 @@ def _expand_row_pairs(row_values):
     )
 
 
+# One pack covers all 64 accumulator values owned by a lane.
+# The 64 scale arguments are copies of that row's scale; only scale0 is needed.
 # fmt: off
 @gluon.jit
-def _rescale_eight(a0, a1, a2, a3, a4, a5, a6, a7,
-                   s0, s1, s2, s3, s4, s5, s6, s7):
-    """Rescale eight accumulator values for map_elementwise(pack=8)."""
-    # pack=8 also supplies eight scale copies; each lane owns just one row.
-    values = (a0, a1, a2, a3, a4, a5, a6, a7)
-    if s0 != 1.0:
-        values = [value * s0 for value in values]
+def _rescale_accumulator64(
+    a0, a1, a2, a3, a4, a5, a6, a7,
+    a8, a9, a10, a11, a12, a13, a14, a15,
+    a16, a17, a18, a19, a20, a21, a22, a23,
+    a24, a25, a26, a27, a28, a29, a30, a31,
+    a32, a33, a34, a35, a36, a37, a38, a39,
+    a40, a41, a42, a43, a44, a45, a46, a47,
+    a48, a49, a50, a51, a52, a53, a54, a55,
+    a56, a57, a58, a59, a60, a61, a62, a63,
+    scale0, *unused_scales,
+):
+    values = (
+        a0, a1, a2, a3, a4, a5, a6, a7,
+        a8, a9, a10, a11, a12, a13, a14, a15,
+        a16, a17, a18, a19, a20, a21, a22, a23,
+        a24, a25, a26, a27, a28, a29, a30, a31,
+        a32, a33, a34, a35, a36, a37, a38, a39,
+        a40, a41, a42, a43, a44, a45, a46, a47,
+        a48, a49, a50, a51, a52, a53, a54, a55,
+        a56, a57, a58, a59, a60, a61, a62, a63,
+    )
+    if scale0 != 1.0:
+        # Gluon unrolls this tuple comprehension at compile time.
+        values = [value * scale0 for value in values]
     return values
 # fmt: on
 
@@ -239,7 +258,7 @@ def _attention_tile(
     fp8_weights = gl.map_elementwise(_convert_four_fp8, weights, pack=4)[0].to(
         gl.float8e4nv, bitcast=True
     )
-    acc = gl.map_elementwise(_rescale_eight, acc, alpha[:, None], pack=8)[0]
+    acc = gl.map_elementwise(_rescale_accumulator64, acc, alpha[:, None], pack=64)[0]
     p_fragment = gl.convert_layout(fp8_weights, gl.DotOperandLayout(0, _WMMA_LAYOUT, 8))
     acc = wmma(p_fragment, v_fragment, acc)
     # Hold both allocations through the barrier: every wave must finish its
