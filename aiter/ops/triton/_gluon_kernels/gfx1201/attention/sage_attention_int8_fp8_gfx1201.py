@@ -6,12 +6,14 @@ Ports the M128/N32 path at leeliu103/aiter sage-attention commit adf0def.
 Q/K: contiguous INT8 [B, P, H, 128]. V: E4M3FN [B, H, 128, P].
 QScale/KScale: FP32 [B, H, P/32]; QScale includes softmax_scale * log2(e).
 VScale: FP32 [B, H, 128]. Out: BF16/FP16 [B, P, H, 128].
-Optional LSE: FP32 [B, H, P], for the supplied (centered) keys.
+Optional LSE: approximate FP32 [B, H, P], for the supplied (centered) keys.
 Here P is PADDED_LEN and H is NUM_HEADS.
 
 Each program keeps 128 queries in registers and streams 32-key K/V tiles.
 An iteration computes INT8 QK, updates online softmax, then accumulates FP8 PV.
-The helpers preserve the reference's rounding order and register ownership.
+Full key tiles use the ASM affine/UNORM FP8 encoding and sum those packed
+probabilities with FP8 dot products. Partial tails retain native exp2 and
+unrounded FP32 sums.
 
 Only valid query rows are written. All input padding must be initialized.
 Addressing requires fewer than 2**31 Q/K elements.
@@ -26,6 +28,13 @@ from triton.experimental.gluon.language.amd.rdna4 import wmma
 
 BLOCK_M = 128
 LAUNCH_OPTIONS = {"num_warps": 8, "num_stages": 1, "waves_per_eu": 0}
+
+# Eight E4M3 codes span one binary exponent step. UNORM16 multiplies by
+# 65535, and selecting its high byte divides by 256.
+_FP8_UNORM_SCALE = gl.constexpr(8 * 256 / 65535)
+# Exact ASM intercept (FP32 bits 0x3e602dee): a byte offset of about 56.044.
+# E4M3 code 56 represents 1.0.
+_FP8_UNORM_OFFSET = gl.constexpr(0.21892520785331726)
 
 # Explicit constexpr wrappers include layouts in Triton's compilation key.
 # Eight waves span the query rows; each lane owns 64 accumulator channels.
@@ -109,9 +118,62 @@ def _sum16(x0, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15)
 
 
 @gluon.jit
-def _lane_probability_sums(probabilities):
+def _approx_four_fp8(x0, x1, x2, x3):
+    # The selector 0x07050301 packs high bytes 1, 3, 5, 7 of four UNORM16 values.
+    word, _ = gl.inline_asm_elementwise(
+        "v_cvt_pk_norm_u16_f32 $0, $2, $3\n"
+        "v_cvt_pk_norm_u16_f32 $1, $4, $5\n"
+        "s_delay_alu instid0(VALU_DEP_2)\n"
+        "v_perm_b32 $0, $1, $0, 0x07050301",
+        constraints="=&v,=&v,v,v,v,v",
+        args=[x0, x1, x2, x3],
+        dtype=(gl.uint32, gl.uint32),
+        is_pure=True,
+        pack=1,
+    )
+    return (
+        word.to(gl.uint8),
+        (word >> 8).to(gl.uint8),
+        (word >> 16).to(gl.uint8),
+        (word >> 24).to(gl.uint8),
+    )
+
+
+@gluon.jit
+def _approx_to_fp8(x):
+    return gl.map_elementwise(_approx_four_fp8, x, pack=4)[0].to(
+        gl.float8e4nv, bitcast=True
+    )
+
+
+@gluon.jit
+def _sum16_fp8(x0, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15):
+    # 0x38 encodes E4M3 1.0, so each dot adds four packed probabilities.
+    w0 = x0 | (x1 << 8) | (x2 << 16) | (x3 << 24)
+    w1 = x4 | (x5 << 8) | (x6 << 16) | (x7 << 24)
+    w2 = x8 | (x9 << 8) | (x10 << 16) | (x11 << 24)
+    w3 = x12 | (x13 << 8) | (x14 << 16) | (x15 << 24)
+    total = gl.inline_asm_elementwise(
+        "v_dot4_f32_fp8_fp8 $0, $1, 0x38383838, 0\n"
+        "s_delay_alu instid0(VALU_DEP_1)\n"
+        "v_dot4_f32_fp8_fp8 $0, $2, 0x38383838, $0\n"
+        "s_delay_alu instid0(VALU_DEP_1)\n"
+        "v_dot4_f32_fp8_fp8 $0, $3, 0x38383838, $0\n"
+        "s_delay_alu instid0(VALU_DEP_1)\n"
+        "v_dot4_f32_fp8_fp8 $0, $4, 0x38383838, $0",
+        constraints="=&v,v,v,v,v",
+        args=[w0, w1, w2, w3],
+        dtype=gl.float32,
+        is_pure=True,
+        pack=1,
+    )
+    return (total,) * 16
+
+
+@gluon.jit
+def _exchange_probability_sums(local):
+    """Collapse repeated lane sums and fetch the peer lane sum."""
     # The two lanes own keys 0..7,16..23 and 8..15,24..31, respectively.
-    local = gl.map_elementwise(_sum16, probabilities, pack=16)[0]
     # Collapse register copies to one scalar per lane. These maxima only
     # select identical copies; they perform no additional probability sum.
     local = gl.max(gl.max(gl.reshape(local, [128, 2, 2, 8]), 3), 1)
@@ -254,21 +316,33 @@ def _attention_tile(
     k_scale = gl.load(KScale + batch_head * (PADDED_LEN // 32) + start // 32)
     scale = q_scale * k_scale
 
-    # The offset puts the largest probability near FP8's maximum value (448).
+    # The 8.807 offset approximates log2(448), using FP8's available range.
     # Keep it inside FMA, as in the reference.
-    # The denominator uses the unrounded probabilities.
     tile_max = gl.fma(gl.max(scores, 1), scale, -8.807)
     new_max = gl.maximum(row_max, tile_max)
     alpha = gl.exp2(row_max - new_max)
-    probabilities = gl.exp2(gl.fma(scores, scale[:, None], -new_max[:, None]))
-    local_sum, peer_sum = _lane_probability_sums(probabilities)
+    if MASK_TAIL:
+        # Keep native exp2 and unrounded sums for the partial key tile.
+        probabilities = gl.exp2(gl.fma(scores, scale[:, None], -new_max[:, None]))
+        fp8_probabilities = _probabilities_to_fp8(probabilities)
+        local_sums = gl.map_elementwise(_sum16, probabilities, pack=16)[0]
+    else:
+        # Preserve the ASM affine operation order before UNORM16 packing.
+        affine_scale = scale * _FP8_UNORM_SCALE
+        # Negate the constant so the FMA forms the signed offset directly,
+        # avoiding a separate runtime negation instruction.
+        affine_offset = gl.fma(new_max, -_FP8_UNORM_SCALE, _FP8_UNORM_OFFSET)
+        transformed = gl.fma(scores, affine_scale[:, None], affine_offset[:, None])
+        fp8_probabilities = _approx_to_fp8(transformed)
+        probability_bits = fp8_probabilities.to(gl.uint8, bitcast=True).to(gl.uint32)
+        local_sums = gl.map_elementwise(_sum16_fp8, probability_bits, pack=16)[0]
+    local_sum, peer_sum = _exchange_probability_sums(local_sums)
     # FlyDSL's fast-math backend forms (alpha * denominator + peer_sum) + local_sum.
     # Keep both lane denominators: rounding can make their values different.
     row_rescale = gl.convert_layout(
         alpha, gl.SliceLayout(1, _ROW_PAIR_LAYOUT), assert_trivial=True
     )
     denominator = gl.fma(row_rescale[:, None], denominator, peer_sum) + local_sum
-    fp8_probabilities = _probabilities_to_fp8(probabilities)
     acc = gl.map_elementwise(_rescale_accumulator64, acc, alpha[:, None], pack=64)[0]
     p_fragment = gl.convert_layout(
         fp8_probabilities, gl.DotOperandLayout(0, _WMMA_LAYOUT, 8)
